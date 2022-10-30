@@ -1,0 +1,1 @@
+from .lstasko import LSTasko

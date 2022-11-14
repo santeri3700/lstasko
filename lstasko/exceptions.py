@@ -27,3 +27,13 @@ class LSTaskoDatabaseNotConnectedException(Exception):
     """ LSTasko not connected to database """
     def __str__(self):
         return "Not connected to a database!"
+
+
+class LSTaskoChannelNotFoundException(Exception):
+    """ LSTAsko couldn't find a channel """
+    def __init__(self, missing, *args):
+        super().__init__(args)
+        self.missing = missing
+
+    def __str__(self):
+        return f"Coundn't find channels with the following identifiers: {self.missing}"

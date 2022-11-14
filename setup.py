@@ -19,7 +19,7 @@ import setuptools
 
 setuptools.setup(
     name='lstasko',
-    version='0.1.0',
+    version='0.2.0',
     description='List Taskomatic tasks',
     url="https://github.com/santeri3700/lstasko",
     author='Santeri Pikarinen',
@@ -30,6 +30,7 @@ setuptools.setup(
     include_package_data=True,
     install_requires=[
         "psycopg2-binary==2.9.5",
+        "javaobj-py3==0.4.3",
         "dataclasses==0.8.0",
         "tabulate==0.9.0",
         "colorlog==6.7.0"

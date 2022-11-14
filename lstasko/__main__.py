@@ -39,7 +39,7 @@ except ImportError:
 
 def main():
     # Arguments
-    argparser = argparse.ArgumentParser(description="lstasko - List Taskomatic tasks")
+    argparser = argparse.ArgumentParser(prog="lstasko", description="lstasko - List Taskomatic tasks")
     argparser.add_argument("-A", "--all", action="store_true",
                            dest="filter_show_all",
                            help="show all Taskomatic tasks (other filters still apply)")
@@ -51,6 +51,10 @@ def main():
                            dest="filter_name", default='all',
                            help="filter tasks per name(s)",
                            metavar="TASK_NAME")
+    argparser.add_argument("-i", "--id", type=int, nargs='+',
+                           dest="filter_id", default=None,
+                           help="filter tasks per id(s)",
+                           metavar="TASK_ID")
     argparser.add_argument("-c", "--columns", type=str.lower, nargs='+',
                            dest="filter_columns", default='default',
                            help="select columns/fields for output",
@@ -69,7 +73,7 @@ def main():
                                   help="rhn.conf for PostgreSQL/libpq connection (default: /etc/rhn/rhn.conf)",
                                   metavar="RHN_CONF_FILE")
     output_group = argparser.add_mutually_exclusive_group()
-    output_group.add_argument("-F", "--output-format",
+    output_group.add_argument("-o", "--output-format",
                               type=str.lower, dest="output_format",
                               help="output as human readable tabulate table (stdout)",
                               metavar="TABULATE_FMT")
@@ -82,7 +86,15 @@ def main():
     argparser.add_argument("-v", "--verbose", action="store_true",
                            dest="output_debug", default=False,
                            help="enable verbose debug output (stderr)")
+    argparser.add_argument("-V", "--version", action="store_true",
+                           dest="output_version", default=False,
+                           help="print version")
     args = argparser.parse_args()
+
+    # Version print
+    if args.output_version:
+        print(f"{'.'.join(map(str, LSTasko.version))}")
+        return True
 
     # Logging
     try:
@@ -159,7 +171,7 @@ def main():
             if not colorlog:
                 logger.debug("Color output is disabled. Colorlog is not installed.")
             if not tabulate:
-                logger.debug("Human readable output is disabled. Tabulate is not installed.")
+                logger.debug("Tabulate is not installed. Non-JSON output might be unreliable.")
 
             # Time
             now = datetime.datetime.now(tz=datetime.timezone.utc)
@@ -211,14 +223,18 @@ def main():
                         f"doesn't match filters: {args.filter_name}. Skipping...")
                     continue
 
+                # ID
+                if args.filter_id is not None and int(task['id']) not in args.filter_id:
+                    logger.debug(
+                        f"Task [{str(task['id']).lower()}] \"{task['name']}\" id " +
+                        f"doesn't match filters: {args.filter_id}. Skipping...")
+                    continue
+
                 # Get repo-sync details (if available)
                 if (task['name'] == 'repo-sync'):
-                    channel_data = lstasko.get_reposync_details(task['data'])
-                    if channel_data:
-                        task['data'] = {
-                            'channel_id': channel_data[0]['channel_id'],
-                            'channel_label': channel_data[0]['channel_label']
-                        }
+                    task_data = lstasko.get_reposync_details(task['data'])
+                    if len(task_data['channels']) > 0:
+                        task['data'] = task_data  # Use parsed data
                     else:
                         task['data'] = None  # Clear unparsed data
 
@@ -251,7 +267,14 @@ def main():
                         task_details.append(f"{task['duration']}s")
                         continue
                     elif not args.output_json and column == 'data' and task['data']:
-                        task_details.append(f"{task['data']['channel_id']} - {task['data']['channel_label']}")
+                        if (task['name'] == 'repo-sync'):
+                            channel_info_list = []
+                            for channel in task['data']['channels']:
+                                channel_info_list.append(f"{channel['label']} ({channel['id']})")
+                            task_details.append(f"{', '.join(channel_info_list)}")
+                        else:
+                            if not isinstance(task['data'], bytes):
+                                task_details.append(task['data'])
                     else:
                         if column in task:
                             task_details.append(task[column])
@@ -304,7 +327,7 @@ def main():
     except BrokenPipeError:
         pass  # Ignore [Errno 32] Broken pipe
     except Exception as e:
-        logger.error(f"Unknown error: {e}")
+        logger.error(f"Unknown error: {e}", exc_info=True)
         return False
 
 

@@ -5,20 +5,20 @@ This project was inspired by [taskotop](https://github.com/uyuni-project/uyuni/b
 
 ## Status
 lstasko requires Python 3.6 or higher and is only tested with the following systems:
-- Uyuni Server 2022.08 (Python 3.6.15 & PostgreSQL 14 + SSL)
-- Uyuni Server 2022.08 (PostgreSQL 14 + SSL) and a remote machine with Python 3.10 running lstasko.
+- Uyuni Server 2022.10 (Python 3.6.15 & PostgreSQL 14 + SSL)
+- Uyuni Server 2022.10 (PostgreSQL 14 + SSL) and a remote machine with Python 3.10 running lstasko.
 
 This project is currently in early development stage and the code may change drastically. \
 Contributions, feedback and feature requests are welcome!
 
 ## Version and changes
-- **Version:** 0.1.0
+- **Version:** 0.2.0
 - **Change logs:** [CHANGELOG.md](CHANGELOG.md)
 
 ## Features
 - Get list of Taskomatic tasks directly from the database
-- Get task details by task id
-- Get Repo-sync Software Channel labels and ids
+- Get task details by task id and/or task name
+- Get Repo-sync Software Channel labels, ids and other details
 - Filter tasks by name, status and max-age
 - Select output columns/fields
 - Output with [Tabulate](https://github.com/astanin/python-tabulate) formatting (default stdout)
@@ -26,10 +26,9 @@ Contributions, feedback and feature requests are welcome!
 
 ## TODO
 - Add ordering per column/field (ASC/DESC).
-- Replace `_hack_parse_reposync_data()` with something more robust and capable of listing flags (no-errata, latest, sync-kickstart, fail).
 - CI/CD.
 - Better Exceptions and Exception handling.
-- Better documentation.
+- Better documentation and comments.
 - Continuous/Follow mode like in `taskotop` or `tail -F`.
 - Maybe rename the project/module/library before PyPI release (taskoinfo, taskomatic-info etc..)
 - Windows/MacOS compatibility (untested at the moment).
@@ -39,8 +38,9 @@ Contributions, feedback and feature requests are welcome!
 
 Dependencies:
 - `psycopg2-binary==2.9.5` (for PostgreSQL database connections)
+- `javaobj-py3==0.4.3` (for repo-sync data parsing)
 - `dataclasses==0.8.0` (required by tabulate)
-- `tabulate==0.8.10` (for human-readable output)
+- `tabulate==0.8.10` (for fancy output)
 - `colorlog==6.7.0` (for colorful log output)
 
 ## Install from source
@@ -65,8 +65,8 @@ lstasko \
 
 sudo lstasko \
 --rhn-conf /etc/rhn/rhn.conf \
+--all \
 --status finished \
---max-age -1 \
 --name repo-sync \
 --columns id name start_time end_time duration data \
 --output-format rst
@@ -94,21 +94,26 @@ db_conn_str = LSTasko().get_rhn_db_conn_str('/etc/rhn/rhn.conf')  # Default path
 # Docs: https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
 db_conn_str = "host=uyuni-server.example.com dbname=uyunidb user=uyuni password=SuperSecretPassword sslmode=verify-full sslrootcert=root.pem"
 
-with LSTasko(db_conn_str) as lstasko:
-    # Fetch a list of all tasks
-    all_tasks = lstasko.get_all_tasks()
+lstasko = LSTasko()
+lstasko.open(db_conn_str)  # LSTasko object on success
 
-    # Get task details per task id
-    lstasko.get_task(12345)  # dict
-    lstasko.get_task([12345, 12346])  # list[dict]
+# Fetch a list of all tasks
+all_tasks = lstasko.get_all_tasks()
 
-    # Get Software Channel id(s) from label(s)
-    lstasko.get_channel_id('centos7-x86_64')  # int(123)
-    lstasko.get_channel_id(['centos7-x86_64', 'centos7-x86_64-updates'])  # [{'channel_id': 123, 'channel_label': 'centos7-x86_64'}, ...]
+# Print all tasks
+print(json.dumps(all_tasks, indent=4, sort_keys=False, cls=LSTasko.JSONEncoder))  # list[dict]
 
-    # Get Software Channel label(s) from id(s)
-    lstasko.get_channel_label(123)  # str('centos7-x86_64')
-    lstasko.get_channel_label([123, 124])  # [{'channel_id': 123, 'channel_label': 'centos7-x86_64'}, ...]
+# Get task details per task id
+lstasko.get_task(12345)  # dict
+lstasko.get_task([12345, 12346])  # list[dict]
+
+# Get Software Channel id(s) from label(s)
+lstasko.get_channel_id('centos7-x86_64')  # int(123)
+lstasko.get_channel_id(['centos7-x86_64', 'centos7-x86_64-updates'])  # [123, 124]
+
+# Get Software Channel label(s) from id(s)
+lstasko.get_channel_label(123)  # str('centos7-x86_64')
+lstasko.get_channel_label([123, 124])  # ['centos7-x86_64', 'centos7-x86_64-updates']
 ```
 
 # Disclaimer

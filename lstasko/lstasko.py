@@ -25,10 +25,14 @@ import psycopg2
 import psycopg2.sql
 import psycopg2.extras
 import psycopg2.extensions
-from .exceptions import LSTaskoException, LSTaskoDatabaseNotConnectedException, LSTaskoNoRhnConfException
+import javaobj.v2 as javaobj
+from .exceptions import LSTaskoException, LSTaskoDatabaseNotConnectedException, \
+                        LSTaskoNoRhnConfException, LSTaskoChannelNotFoundException
 
 
 class LSTasko:
+    version = (0, 2, 0)
+
     def __init__(self, db_conn_str: str = None):
         self.logger = logging.getLogger('lstasko')
         self._db_conn_str = db_conn_str
@@ -63,8 +67,11 @@ class LSTasko:
                 return str(data)
             if isinstance(data, bytes):
                 try:
-                    channel_data = LSTasko._hack_parse_reposync_data(data)
-                    return channel_data
+                    reposync_details = LSTasko.get_reposync_details(LSTasko, data)
+                    if reposync_details:
+                        return reposync_details
+                    else:
+                        return None
                 except Exception:
                     logging.getLogger('lstasko').debug("Unknown bytes parsing error!", exc_info=True)
                     return str(data)
@@ -196,160 +203,242 @@ class LSTasko:
                 else:
                     return None
         except (FileNotFoundError, PermissionError, OSError) as e:
-            # self.logger.error(f"Could not open rhn.conf: {e}")
             raise LSTaskoNoRhnConfException(f"Could not open rhn.conf: {e}")
-
-    def _hack_parse_reposync_data(self, data: bytes):
-        """HACK: Converts reposync data bytes into list of dicts containing channel_id and channel_label"""
-        # Specification: https://docs.oracle.com/javase/8/docs/platform/serialization/spec/protocol.html
-        # Object Stream Constants: TC_STRING = 0x74 ('t'), TC_ENDBLOCKDATA = 0x78 ('x')
-        # Data format: magic_bytes ... field_name [TC_STRING] value_length_16be field_value [TC_ENDBLOCKDATA]
-        # Single channel repo-sync data: \xac\xed\x00\x05...channel_idt\x00\x03123x
-        # FIXME: We currently handle only single channel repo-sync data.
-        magic_bytes = b'\xac\xed\x00\x05'  # Java Object Serialization Stream magic bytes
-        tc_string = b'\x74'  # 't'
-
-        if (data[0:len(magic_bytes)] == magic_bytes):
-            self.logger.debug("HACK: Parse repo-sync data")
-            self.logger.debug(f"Raw data: {data}")
-
-            string_pattern = 'channel_id'
-            byte_pattern = str.encode(string_pattern)
-            offset = data.find(byte_pattern) + len(byte_pattern)
-
-            if offset:
-                object_tc = data[offset:offset+1]
-                object_tc_hex = hex(int.from_bytes(object_tc, "big"))
-                self.logger.debug(f"Offset: {offset}, Stream constant type: {object_tc} ({object_tc_hex})")
-                if (object_tc == tc_string):  # single channel id
-                    value_length = int.from_bytes(data[offset+2:offset+3], "big")  # channel id number length
-                    value_offset = offset + int.from_bytes(data[offset+1:offset+3], "big")  # channel id value offset
-                    self.logger.debug(
-                        f"Value length: {value_length}, "
-                        f"Value: {data[value_offset:value_offset+value_length]}"
-                    )
-                    channel_id = int(data[value_offset:value_offset+value_length])
-                    channel_details = self.get_channel_details(channel_id)
-                    if channel_details:
-                        self.logger.debug("Repo-sync information retrieved successfully!")
-                    return [
-                        {
-                            'channel_id': int(channel_details['channel_id']),
-                            'channel_label': str(channel_details['channel_label'])
-                        }
-                    ]
-                else:
-                    self.logger.debug("Data is not from a single channel repo-sync. Can't parse!")
-
-        return None
 
     def get_reposync_details(self, data: bytes):
         """Get repo-sync task details from task bytes"""
-        return self._hack_parse_reposync_data(data)
+        details = {
+            'no-errata': False,
+            'latest': False,
+            'sync-kickstart': False,
+            'fail': False,
+            'channels': []
+        }
 
-    def get_channel_label(self, channel_ids: Union[int, list]):
-        """Get channel label(s) as a string or list of dicts containing channel_id and channel_label"""
+        try:
+            obj = javaobj.loads(data)
+            for class_definition, annotations in obj.annotations.items():
+                # Skip everything that is not a Java HashMap
+                if class_definition.name != "java.util.HashMap":
+                    continue
+
+                for index, annotation in enumerate(annotations):
+                    # Multi-channel repo-sync
+                    if annotation == 'channel_ids':
+                        for subclass_definition, subannotations in annotations[index+1].annotations.items():
+                            if len(subannotations) > 1:
+                                self.logger.debug(f"subclass_definition: {subclass_definition}")
+                                for channel_id in subannotations[1:]:
+                                    # Convert JavaString to int
+                                    channel_id = int(str(channel_id))
+
+                                    # Append to details
+                                    channel_details = self.get_channel_details(channel_id)
+                                    details['channels'].append(channel_details)
+
+                    # Single-channel repo-sync
+                    elif annotation == 'channel_id':
+                        # Convert JavaString to int
+                        channel_id = int(str(annotations[index+1]))
+
+                        # Append to details
+                        channel_details = self.get_channel_details(channel_id)
+                        details['channels'].append(channel_details)
+                    # Repo-sync extra properties
+                    elif annotation in ['no-errata', 'latest', 'sync-kickstart', 'fail']:
+                        # Convert JavaString "true" and "false" to bool
+                        details[annotation] = True if str(annotations[index+1]).lower() == 'true' else False
+        except Exception as e:
+            self.logger.debug(f"Channel repo-sync details could not be parsed! Error: {e}", exc_info=True)
+            pass
+
+        return details
+
+    def get_channel_name(self, channel_identifiers: Union[int, str, list], ignore_missing: bool = False):
+        """Get channel name(s) as a string or list of strings"""
 
         if not self._db_cursor:
             raise LSTaskoDatabaseNotConnectedException()
 
-        if isinstance(channel_ids, list):
-            return_type = list
-            for i, channel_id in enumerate(channel_ids):
-                channel_ids[i] = psycopg2.sql.Literal(int(channel_id))
-        elif isinstance(channel_ids, int):
-            return_type = int
-            channel_ids = [psycopg2.sql.Literal(channel_ids)]
-        else:
-            raise ValueError("Invalid argument value type!")
+        channel_details = self.get_channel_details(channel_identifiers, ignore_missing)
 
-        if len(channel_ids) == 0:
-            raise ValueError("Argument must be list (of ints) or singular int!")
+        if isinstance(channel_details, dict):
+            return str(channel_details['name'])
+        elif isinstance(channel_details, list):
+            results = list(channel_identifiers)
+            updated = []
+            for single_channel_details in channel_details:
+                for i, identifier in enumerate(results):
 
-        query = psycopg2.sql.SQL(
-            "SELECT DISTINCT id, label "
-            "FROM rhnChannel "
-            "WHERE id IN ("
-            f"{psycopg2.sql.SQL(', ').join(channel_ids).as_string(self._db_connection)}"
-            ") "
-            "ORDER BY label"
-        )
+                    if isinstance(identifier, str) and identifier == str(single_channel_details['label']):
+                        results[i] = str(single_channel_details['name'])
+                        updated.append(i)
+                    elif isinstance(identifier, int) and identifier == int(single_channel_details['id']):
+                        results[i] = str(single_channel_details['name'])
+                        updated.append(i)
 
-        self._db_cursor.execute(query)
+            # Set not found identifiers to None
+            for i in range(len(results)):
+                if i not in updated:
+                    results[i] = None
 
-        result = self._db_cursor.fetchall()
+            return results
 
-        if not result:
-            return None
-
-        if return_type == int:
-            self.logger.debug(f"Result single channel: {result}")
-            return str(dict(result[0])['label'])
-        else:
-            self.logger.debug(f"Result multiple channels: {result}")
-            channels = []
-            for row in result:
-                channels.append({'channel_id': int(row['id']), 'channel_label': str(row['label'])})
-            return channels
-
-    def get_channel_id(self, channel_labels: Union[str, list]):
-        """Get channel id(s) as an int or list of dicts containing channel_id and channel_label"""
+    def get_channel_label(self, channel_identifiers: Union[int, str, list], ignore_missing: bool = False):
+        """Get channel labels(s) as a string or list of strings"""
 
         if not self._db_cursor:
             raise LSTaskoDatabaseNotConnectedException()
 
-        if isinstance(channel_labels, list):
-            return_type = list
-            for i, channel_label in enumerate(channel_labels):
-                channel_labels[i] = psycopg2.sql.Literal(str(channel_label))
-        elif isinstance(channel_labels, str):
-            return_type = int
-            channel_labels = [psycopg2.sql.Literal(channel_labels)]
+        channel_details = self.get_channel_details(channel_identifiers, ignore_missing)
+
+        if isinstance(channel_details, dict):
+            return str(channel_details['label'])
+        elif isinstance(channel_details, list):
+            results = list(channel_identifiers)
+            updated = []
+            for single_channel_details in channel_details:
+                for i, identifier in enumerate(results):
+
+                    if isinstance(identifier, str) and identifier == str(single_channel_details['label']):
+                        results[i] = str(single_channel_details['label'])
+                        updated.append(i)
+                    elif isinstance(identifier, int) and identifier == int(single_channel_details['id']):
+                        results[i] = str(single_channel_details['label'])
+                        updated.append(i)
+
+            # Set not found identifiers to None
+            for i in range(len(results)):
+                if i not in updated:
+                    results[i] = None
+
+            return results
+
+    def get_channel_id(self, channel_identifiers: Union[int, str, list], ignore_missing: bool = False):
+        """Get channel id(s) as an int or list of ints"""
+
+        if not self._db_cursor:
+            raise LSTaskoDatabaseNotConnectedException()
+
+        channel_details = self.get_channel_details(channel_identifiers, ignore_missing)
+
+        if isinstance(channel_details, dict):
+            return int(channel_details['id'])
+        elif isinstance(channel_details, list):
+            results = list(channel_identifiers)
+            updated = []
+            for single_channel_details in channel_details:
+                for i, identifier in enumerate(results):
+
+                    if isinstance(identifier, str) and identifier == str(single_channel_details['label']):
+                        results[i] = int(single_channel_details['id'])
+                        updated.append(i)
+                    elif isinstance(identifier, int) and identifier == int(single_channel_details['id']):
+                        results[i] = int(single_channel_details['id'])
+                        updated.append(i)
+
+            # Set not found identifiers to None
+            for i in range(len(results)):
+                if i not in updated:
+                    results[i] = None
+
+            return results
+
+    def get_channel_details(self, channel_identifiers: Union[int, str, list], ignore_missing: bool = False):
+        """Get channel details as a dict or list"""
+
+        if not self._db_cursor:
+            raise LSTaskoDatabaseNotConnectedException()
+
+        # Items used in the SQL query
+        search_items = {
+            "labels": [],
+            "ids": []
+        }
+
+        # Parse channel identifiers (ids and labels) and determine return type (dict or list)
+        if isinstance(channel_identifiers, list):  # List of channel ids and/or labels
+            return_type = list  # Return a list of channel details
+            for channel_identifier in channel_identifiers:
+                if isinstance(channel_identifier, int):  # Channel ID
+                    search_items['ids'].append(int(channel_identifier))
+                elif isinstance(channel_identifier, str):  # Channel label
+                    search_items['labels'].append(str(channel_identifier))
+        elif isinstance(channel_identifiers, str):  # Single channel label
+            return_type = dict  # Return a single channel details dict
+            search_items['labels'].append(str(channel_identifiers))
+        elif isinstance(channel_identifiers, int):  # Single channel ID
+            return_type = dict  # Return a single channel details dict
+            search_items['ids'].append(int(channel_identifiers))
         else:
             raise ValueError("Invalid argument value type!")
 
-        if len(channel_labels) == 0:
-            raise ValueError("Argument must be list (of strings) or singular string!")
+        if len(search_items["ids"]) == 0 and len(search_items["labels"]) == 0:
+            raise ValueError("Argument must be a channel label or a channel id or a list of those!")
 
-        query = psycopg2.sql.SQL(
-            "SELECT DISTINCT id, label "
-            "FROM rhnChannel "
-            "WHERE label IN ("
-            f"{psycopg2.sql.SQL(', ').join(channel_labels).as_string(self._db_connection)}"
-            ") "
-            "ORDER BY id"
-        )
+        # Convert ids to list of Literals
+        channel_ids = []
+        for channel_id in search_items["ids"]:
+            channel_ids.append(psycopg2.sql.Literal(channel_id))
 
-        self._db_cursor.execute(query)
+        # Convert labels to list of Literals
+        channel_labels = []
+        for channel_label in search_items["labels"]:
+            channel_labels.append(psycopg2.sql.Literal(channel_label))
 
+        # Construct query
+        query = "SELECT * FROM rhnChannel WHERE "
+
+        # Search for channel IDs
+        if len(channel_ids) > 0:
+            channel_ids_list = psycopg2.sql.SQL(', ').join(channel_ids).as_string(self._db_connection)
+            query += f"id IN ({channel_ids_list}) "
+
+        # Search for channel labels
+        if len(channel_labels) > 0:
+            channel_labels_list = psycopg2.sql.SQL(', ').join(channel_labels).as_string(self._db_connection)
+            # Add OR condition if ids are also being searched
+            if len(channel_ids) > 0:
+                query += "OR "
+            query += f"label IN ({channel_labels_list}) "
+
+        # Execute query and fetch all results
+        self._db_cursor.execute(psycopg2.sql.SQL(query))
         result = self._db_cursor.fetchall()
 
         if not result:
             return None
+        elif len(result) < (len(channel_ids) + len(channel_labels)):
+            # Less results than search items
+            if not ignore_missing:
+                found_ids = []
+                found_labels = []
+                missing = []
 
-        if return_type == int:
+                for row in result:
+                    if int(row['id']) in search_items["ids"]:
+                        found_ids.append(int(row['id']))
+                    if str(row['label']) in search_items["labels"]:
+                        found_labels.append(str(row['label']))
+
+                for channel_id in search_items["ids"]:
+                    if int(channel_id) not in found_ids:
+                        missing.append(int(channel_id))
+
+                for channel_label in search_items["labels"]:
+                    if str(channel_label) not in found_labels:
+                        missing.append(str(channel_label))
+
+                # Raise with list of missing channel identifiers
+                raise LSTaskoChannelNotFoundException(missing)
+
+        # Return channel details per return type
+        if return_type == dict:
             self.logger.debug(f"Result single channel: {result}")
-            return int(dict(result[0])['id'])
+            return dict(result[0])
         else:
             self.logger.debug(f"Result multiple channels: {result}")
-            channels = []
-            for row in result:
-                channels.append({'channel_id': int(row['id']), 'channel_label': str(row['label'])})
-            return channels
-
-    def get_channel_details(self, channel: Union[int, str]):
-        channel_id = None
-        channel_label = None
-        if isinstance(channel, int):
-            channel_id = channel
-            channel_label = self.get_channel_label(int(channel_id))
-        elif isinstance(channel, str):
-            channel_label = channel
-            channel_id = self.get_channel_id(channel_label)
-        else:
-            raise ValueError("Channel argument must be int (id) or str (label)!")
-
-        return {'channel_id': int(channel_id), 'channel_label': str(channel_label)}
+            return list(result)
 
     def get_task(self, task: Union[int, list]):
         """Get Taskomatic task(s) per task id(s)"""
